@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from pathlib import Path
 from typing import Any
 
 from .codex import CodexRunner
@@ -8,6 +7,7 @@ from .config import Settings
 from .db import StateDB
 from .gitlab import GitLabClient
 from .models import CodexResult, Job
+from .prompts import initial_prompt, recovery_prompt, resume_prompt
 from .repository import RepositoryManager
 
 log = logging.getLogger(__name__)
@@ -137,10 +137,10 @@ class Orchestrator:
                     raise RuntimeError("cannot resume: job has no Codex session_id")
             else:
                 if recovering and job.session_id:
-                    prompt = self._recovery_prompt(issue)
+                    prompt = recovery_prompt(issue)
                     session_id = job.session_id
                 else:
-                    prompt = self._initial_prompt(issue, project, branch)
+                    prompt = initial_prompt(issue, project, branch)
                     session_id = None
 
             async def persist_thread(thread_id: str) -> None:
@@ -172,40 +172,6 @@ class Orchestrator:
             except Exception:
                 log.exception("failed to publish error to GitLab")
 
-    def _initial_prompt(self, issue: dict[str, Any], project: dict[str, Any], branch: str) -> str:
-        return f"""
-You are analyzing a GitLab issue against the repository checked out in the current directory.
-Do not modify files. Inspect the codebase deeply enough to understand the requested change and its implications.
-
-Project: {project.get('path_with_namespace', project.get('name', 'unknown'))}
-Default branch: {branch}
-Issue: #{issue.get('iid')} {issue.get('title', '')}
-Issue URL: {issue.get('web_url', '')}
-
-Issue description:
----
-{issue.get('description') or '(empty)'}
----
-
-Your job:
-1. Understand the issue and relevant existing code/architecture.
-2. Identify concrete implementation areas, risks, hidden dependencies, and acceptance criteria.
-3. If essential information is missing, return status=needs_input and ask only precise questions that block a good implementation plan.
-4. If enough information is available, return status=complete with a concise summary and a detailed actionable analysis.
-5. Never include private chain-of-thought. Return conclusions, evidence from the repository, and actionable reasoning only.
-""".strip()
-
-    def _recovery_prompt(self, issue: dict[str, Any]) -> str:
-        return f"""
-The orchestrator restarted while the previous turn may have been interrupted.
-Continue the same analysis safely. Re-read the current repository state and the GitLab issue context below, then produce the required structured result.
-Do not modify files.
-
-Issue #{issue.get('iid')}: {issue.get('title', '')}
-Current description:
-{issue.get('description') or '(empty)'}
-""".strip()
-
     async def _resume_prompt(self, job: Job, issue: dict[str, Any], *, recovering: bool) -> str:
         notes = await self.gitlab.list_notes(job.project_id, job.issue_iid)
         user_notes: list[str] = []
@@ -220,26 +186,8 @@ Current description:
             author = (note.get("author") or {}).get("username") or (note.get("author") or {}).get("name") or "user"
             user_notes.append(f"[{author}] {body}")
 
-        answers = "\n\n".join(user_notes) if user_notes else "(No new non-system comments were found.)"
-        prefix = "The orchestrator restarted during this continuation. " if recovering else ""
-        return f"""
-{prefix}Continue the SAME Codex session. The human has reviewed your previous questions and manually requested continuation.
-Do not modify files. Re-check repository files when useful.
-
-Current issue title: {issue.get('title', '')}
-Current issue description:
----
-{issue.get('description') or '(empty)'}
----
-
-New human comments after your last orchestrator note:
----
-{answers}
----
-
-Use these clarifications to continue the previous analysis. If essential questions remain, return needs_input with only the remaining blocking questions. Otherwise return complete with the final actionable analysis.
-Do not reveal private chain-of-thought.
-""".strip()
+        answers = "\n\n".join(user_notes) if user_notes else "(Новых комментариев пользователя не найдено.)"
+        return resume_prompt(issue, answers, recovering=recovering)
 
     async def _publish_result(self, project_id: int, issue_iid: int, result: CodexResult) -> None:
         if result.status == "needs_input" and result.questions:

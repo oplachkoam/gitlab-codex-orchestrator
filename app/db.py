@@ -110,7 +110,7 @@ class StateDB:
                     """
                     UPDATE jobs
                     SET state='running_resume', last_error=NULL, updated_at=?
-                    WHERE project_id=? AND issue_iid=? AND state='waiting'
+                    WHERE project_id=? AND issue_iid=? AND state IN ('waiting', 'done')
                     """,
                     (_now(), project_id, issue_iid),
                 )
