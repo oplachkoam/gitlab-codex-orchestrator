@@ -70,21 +70,17 @@ class CodexRunner:
             "codex",
             "exec",
             "--json",
-            "--sandbox",
-            self.settings.codex_sandbox,
             "--output-schema",
             str(self.schema_path),
             "--output-last-message",
             str(result_path),
-            "-c",
-            f'model_reasoning_effort="{self.settings.codex_reasoning_effort}"',
+            # Keep secrets such as GITLAB_TOKEN out of the agent environment.
+            # Git itself authenticates through glab's on-disk credential helper.
             "-c",
             'shell_environment_policy.inherit="core"',
             "-c",
             "shell_environment_policy.ignore_default_excludes=false",
         ]
-        if self.settings.codex_model:
-            cmd += ["--model", self.settings.codex_model]
         if session_id:
             cmd += ["resume", session_id, prompt]
         else:

@@ -102,7 +102,11 @@ class StateDB:
                 raise
 
     def claim_resume(self, project_id: int, issue_iid: int) -> bool:
-        """CAS WAITING -> RUNNING_RESUME. Only one duplicate event can win."""
+        """CAS WAITING/DONE -> RUNNING_RESUME. Only one duplicate event can win.
+
+        DONE is intentionally resumable: a human can add a follow-up comment and
+        `ai::resume` to continue the same persisted Codex thread.
+        """
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:

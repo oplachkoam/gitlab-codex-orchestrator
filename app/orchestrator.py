@@ -2,9 +2,9 @@ import asyncio
 import logging
 from typing import Any
 
-from .codex import CodexRunner
+from app.codex import CodexRunner
 from .config import Settings
-from .db import StateDB
+from app.db import StateDB
 from .gitlab import GitLabClient
 from .models import CodexResult, Job
 from .prompts import initial_prompt, recovery_prompt, resume_prompt
@@ -111,6 +111,7 @@ class Orchestrator:
                     self.settings.trigger_label,
                     self.settings.resume_label,
                     self.settings.waiting_label,
+                    self.settings.done_label,
                     self.settings.error_label,
                 ],
             )

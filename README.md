@@ -1,104 +1,112 @@
 # GitLab Codex Orchestrator
 
-A small deterministic background service that turns GitLab issues into resumable Codex CLI analysis sessions.
+Deterministic background orchestrator for GitLab Issues + resumable Codex CLI sessions.
 
-The orchestrator itself does **not** use the OpenAI SDK, Responses API directly, `OPENAI_API_KEY`, or `CODEX_API_KEY`. All model interaction happens inside the Codex CLI, authenticated once with your ChatGPT/Codex account using `codex login`.
+The Python service itself does not call OpenAI APIs. It handles webhooks, labels, SQLite state, repository checkout and Codex thread IDs. All model work is performed by Codex CLI authenticated with `codex login`.
 
 ## Workflow
 
-1. A GitLab issue gets `ai::ready`.
-2. GitLab sends an Issue Hook to the service.
-3. The service atomically claims `(project_id, issue_iid)` in SQLite and changes the issue to `ai::analyzing`.
-4. It creates an isolated repository clone under `/data/workspaces/<project>/<issue>`.
-5. It runs `codex exec --json` in read-only mode and stores the emitted Codex `thread_id`.
-6. If Codex needs clarification, it posts questions and changes the issue to `ai::waiting`.
-7. A human answers in issue comments and manually adds/replaces the label with `ai::resume`.
-8. The service runs `codex exec resume <thread_id> ...`, feeding the new comments into the **same Codex session**.
-9. It either asks another round of questions or posts the final analysis and sets `ai::done`.
+```text
+ai::ready
+   ↓ GitLab webhook
+ai::analyzing
+   ↓
+Codex: inspect → implement → test → commit → push feature branch
+   ├─ blocking question → ai::waiting
+   │                         ↓ human comment + ai::resume
+   │                      same Codex thread
+   │
+   └─ complete → ai::done
+                  ↓
+              ai::resume is allowed again for follow-up work
+```
 
-## Architecture
+`ai::done` is not destructive: `thread_id` and workspace remain persisted. Add a new issue comment and `ai::resume` to continue the same Codex session.
+
+## Authentication model
+
+There are exactly two independent authentications, but only one GitLab access token:
 
 ```text
-GitLab Issue Hook
-       |
-       v
-+-----------------------------+
-| Python orchestrator         |
-|                             |
-| FastAPI webhook             |
-| SQLite/WAL state machine    |
-| GitLab REST client          |
-| Git repository manager      |
-+-------------+---------------+
-              |
-              | subprocess
-              v
-       +-------------+
-       | Codex CLI   |
-       | ChatGPT auth|
-       +------+------+ 
-              |
-              v
-         Codex service
+ChatGPT / Codex
+  └─ codex login --device-auth
+     └─ /data/codex/auth.json
+
+GitLab
+  └─ GITLAB_TOKEN
+     └─ glab auth login at container startup
+        ├─ Python GitLab REST client uses the same env token
+        └─ git clone/fetch/push use glab auth git-credential
 ```
 
-There is no LLM decision-making in the orchestration layer. Label transitions, locking, repository preparation, prompt construction, comment collection, retries, and session IDs are all handled deterministically by Python code.
+The GitLab token is not copied into the Codex process environment. Codex can still perform normal HTTPS `git push` because Git invokes the configured `glab auth git-credential` helper.
 
-## Requirements
+Because Codex runs with `danger-full-access` inside the Docker security boundary, treat the whole container as trusted: Codex can invoke `glab` and therefore can use the configured GitLab identity. Use a project-scoped token where possible.
 
-On the host you only need:
+## GitLab token
 
-- Docker;
-- network access to your GitLab instance;
-- network access required by Codex;
-- a ChatGPT account/workspace with Codex access.
+Recommended: Project Access Token with role `Developer` and scopes:
 
-You do **not** need Codex, Node.js, Python, or Git installed on the host. They are inside the image.
-
-## 1. Build the image
-
-```bash
-docker build -t gitlab-codex-orchestrator:local .
+```text
+api
+write_repository
 ```
 
-The image contains:
+One token is enough for Issue API operations and HTTPS Git push.
 
-- Python;
-- Git;
-- Node.js;
-- `@openai/codex`;
-- `bubblewrap` for Codex sandboxing on Linux;
-- the orchestrator itself.
-
-For reproducible production deployments, pin the Codex CLI version you tested:
+## Build
 
 ```bash
 docker build \
-  --build-arg CODEX_VERSION=<tested-version> \
-  -t gitlab-codex-orchestrator:0.2.0 .
+  --build-arg CODEX_VERSION=latest \
+  --build-arg GLAB_VERSION=1.109.0 \
+  -t gitlab-codex-orchestrator:local \
+  .
 ```
 
-## 2. Create the persistent volume
+The image contains Python, Git, Node.js, Codex CLI and GitLab CLI (`glab`).
 
-The same volume stores:
+The Dockerfile forces IPv4 for apt and configures retries/timeouts because some Docker/VPN environments stall on Debian IPv6 mirrors.
 
-- `/data/codex/auth.json` — Codex login credentials;
-- `/data/codex/config.toml` — Codex configuration;
-- `/data/state.db` — orchestrator state;
-- `/data/workspaces/...` — per-issue repository clones;
-- Codex session data required for `resume`.
+## Codex config at image build time
 
-Create it once:
+Edit `codex-config.toml` before `docker build`:
+
+```toml
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+model_reasoning_effort = "high"
+cli_auth_credentials_store = "file"
+```
+
+It is copied into:
+
+```text
+/etc/codex/config.toml
+```
+
+`app/codex.py` no longer hardcodes model/sandbox/reasoning flags, so these settings belong to Codex configuration rather than orchestrator `.env`.
+
+If your persistent volume already contains `/data/codex/config.toml`, remember that user-level Codex config can override applicable system settings. Remove or update stale settings there if needed.
+
+## Persistent volume
 
 ```bash
 docker volume create gitlab-codex-data
 ```
 
-Do not recreate or casually delete this volume if you need existing Codex sessions to resume.
+It stores:
 
-## 3. Log Codex in once
+```text
+/data/codex/          Codex auth + sessions
+/data/state.db        SQLite orchestrator state
+/data/workspaces/     per-issue repository clones
+/data/results/        temporary structured Codex results
+```
 
-For a Docker/headless environment, use Codex device-code login:
+## Codex login
+
+One-time headless login:
 
 ```bash
 docker run --rm -it \
@@ -107,25 +115,7 @@ docker run --rm -it \
   codex login --device-auth
 ```
 
-Codex prints a URL and a one-time code. Open the URL on your normal computer, sign in to ChatGPT, and enter the code.
-
-If device-code login is disabled for your account/workspace, enable it in the relevant ChatGPT security/workspace settings first.
-
-The image sets:
-
-```text
-CODEX_HOME=/data/codex
-```
-
-and forces:
-
-```toml
-cli_auth_credentials_store = "file"
-```
-
-so the login is written to the persistent Docker volume instead of disappearing with the temporary login container.
-
-Check the login:
+Check it:
 
 ```bash
 docker run --rm \
@@ -134,23 +124,15 @@ docker run --rm \
   codex login status
 ```
 
-The normal service also checks `codex login status` during startup. If the volume is not logged in, the container fails fast instead of claiming a GitLab issue and failing later.
+No `OPENAI_API_KEY` or `CODEX_API_KEY` is required.
 
-### Credential lifetime
-
-Codex manages its ChatGPT session itself and can refresh the file-backed login. Because `/data/codex` is persistent, refreshed credentials remain available across container restarts.
-
-Treat `/data/codex/auth.json` like a password. Do not commit, export, or expose it to other containers.
-
-## 4. Configure GitLab
-
-Copy the example:
+## Configure
 
 ```bash
 cp .env.example .env
 ```
 
-Edit at least:
+Minimum:
 
 ```env
 GITLAB_URL=https://gitlab.example.com
@@ -158,16 +140,14 @@ GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx
 GITLAB_WEBHOOK_SECRET=replace-with-a-long-random-secret
 ```
 
-There is intentionally **no** `OPENAI_API_KEY` in the configuration.
+Optional Git identity:
 
-The GitLab token must be able to:
+```env
+GIT_AUTHOR_NAME=Codex Orchestrator
+GIT_AUTHOR_EMAIL=codex-orchestrator@localhost
+```
 
-- read the repository over HTTPS;
-- read issues and notes;
-- update issue labels;
-- create issue notes.
-
-## 5. Run the service
+## Run
 
 ```bash
 docker run -d \
@@ -179,152 +159,116 @@ docker run -d \
   gitlab-codex-orchestrator:local
 ```
 
-Check logs:
+Logs:
 
 ```bash
 docker logs -f gitlab-codex-orchestrator
 ```
 
-Health check:
+Health:
 
 ```bash
 curl http://127.0.0.1:8080/healthz
 ```
 
-Verify Codex login from the running container if needed:
+Verify GitLab auth from the running container without exposing the token:
 
 ```bash
-docker exec gitlab-codex-orchestrator codex login status
+docker exec gitlab-codex-orchestrator glab auth status
 ```
 
-## 6. Configure the GitLab webhook
+## What entrypoint does with GitLab auth
 
-Create a project webhook:
+At every normal container start, if `GITLAB_TOKEN` is present:
+
+1. parses the host from `GITLAB_URL`;
+2. runs non-interactive `glab auth login --stdin`;
+3. configures `oauth2` as the HTTPS token username;
+4. registers `glab auth git-credential` as Git's credential helper for that host;
+5. configures default Git commit identity;
+6. verifies `glab auth status` without printing the token.
+
+A temporary container used only for `codex login` may start without GitLab variables; GitLab setup is skipped in that case.
+
+## Test Git push manually
+
+After the service has cloned an issue workspace:
+
+```bash
+docker exec -it gitlab-codex-orchestrator sh
+cd /data/workspaces/<project-id>/<issue-iid>
+git remote -v
+git push -u origin HEAD
+```
+
+You should not be prompted for username/password.
+
+## GitLab webhook
+
+Orchestrator endpoint:
 
 ```text
-URL:          https://your-orchestrator.example.com/webhooks/gitlab
-Secret token: same value as GITLAB_WEBHOOK_SECRET
-Trigger:      Issues events
-```
-
-The orchestrator validates `X-Gitlab-Token` and refetches the issue from the GitLab API before acting, so it does not trust the webhook label snapshot as the source of truth.
-
-## Labels
-
-Defaults:
-
-| Purpose | Label |
-|---|---|
-| Start analysis | `ai::ready` |
-| Codex is running | `ai::analyzing` |
-| Waiting for human | `ai::waiting` |
-| Resume same thread | `ai::resume` |
-| Finished | `ai::done` |
-| Failed | `ai::error` |
-
-All names are configurable in `.env`.
-
-## Typical issue flow
-
-```text
-bug, backend, ai::ready
-        |
-        v
-bug, backend, ai::analyzing
-        |
-        v
-bug, backend, ai::waiting
-```
-
-The orchestrator posts something like:
-
-```markdown
-### Codex analysis — clarification needed
-
-I found the existing billing flow in `internal/billing/...`.
-
-#### Questions
-1. Should retries be idempotent across process restarts?
-2. Is backward compatibility with v1 clients required?
-```
-
-Answer using normal GitLab issue comments, then manually add/change the label to:
-
-```text
-ai::resume
-```
-
-The service reads new non-system comments posted after its previous question, then invokes the stored Codex `thread_id` with `codex exec resume`.
-
-## State and atomicity
-
-SQLite lives at `/data/state.db` in WAL mode. The primary key is:
-
-```text
-(project_id, issue_iid)
-```
-
-Initial acquisition is an atomic `INSERT OR IGNORE`; continuation is a compare-and-swap transition from `waiting` to `running_resume`.
-
-Duplicate GitLab webhook deliveries therefore cannot start two Codex runs for the same issue inside one service instance. If a label event arrives while that issue is already queued/running, it is coalesced into one follow-up pass rather than silently dropped.
-
-This design intentionally targets **one running container**. For multiple replicas, replace the SQLite claim mechanism with PostgreSQL/advisory locks or another distributed lock.
-
-## Crash recovery
-
-The Codex `thread_id` is persisted as soon as the `thread.started` JSONL event is observed.
-
-If the container restarts during the initial analysis:
-
-- if a `thread_id` was already stored, the service resumes the same session;
-- otherwise it restarts the initial Codex turn.
-
-If it restarts during a clarification continuation, it re-enters the stored session and resupplies the clarification context.
-
-The same repository workspace is preserved across clarification rounds.
-
-## Configuration
-
-Important variables:
-
-```env
-MAX_WORKERS=2
-CODEX_MODEL=
-CODEX_REASONING_EFFORT=high
-CODEX_SANDBOX=read-only
-CODEX_TIMEOUT_SECONDS=1800
-GIT_DEPTH=0
-```
-
-- `MAX_WORKERS`: number of different issues that may be analyzed concurrently.
-- `CODEX_MODEL`: empty means use the Codex CLI default.
-- `CODEX_REASONING_EFFORT`: passed to Codex config.
-- `CODEX_SANDBOX=read-only`: recommended for this analysis-only workflow.
-- `CODEX_TIMEOUT_SECONDS`: hard timeout for one Codex turn.
-- `GIT_DEPTH=0`: full repository history; positive number enables shallow clone.
-
-## Security
-
-The orchestrator:
-
-- validates the GitLab webhook secret with constant-time comparison;
-- runs Codex with a read-only sandbox by default;
-- keeps GitLab credentials out of the Codex subprocess environment;
-- keeps Codex authentication in `/data/codex/auth.json`, not environment variables;
-- configures Codex shell environment inheritance conservatively;
-- does not run repository-owned setup scripts, package installation, tests, or hooks itself;
-- uses JSON Schema structured output instead of parsing prose markers.
-
-Repositories and issue contents must still be treated as untrusted prompt input. Keep this service on trusted private infrastructure and do not switch it to unrestricted sandbox access unless you intentionally accept that risk.
-
-## API endpoints
-
-```text
-GET  /healthz
 POST /webhooks/gitlab
 ```
 
-There is intentionally no public endpoint that accepts arbitrary Codex prompts. GitLab issue state is the control plane.
+Example externally:
+
+```text
+https://codex.example.com/webhooks/gitlab
+```
+
+Configure the project webhook with the same secret as `GITLAB_WEBHOOK_SECRET` and enable the Issue/Work Item event that produces GitLab `Issue Hook` events. The service refetches the current Issue state through the API before acting.
+
+Only label transitions drive work. Comments alone do not resume Codex; after answering, manually set `ai::resume`.
+
+## Labels
+
+```text
+ai::ready      start a new task
+ai::analyzing  Codex is currently running
+ai::waiting    waiting for blocking human clarification
+ai::resume     resume the same Codex thread
+ai::done       task completed
+ai::error      orchestrator/infrastructure failure
+```
+
+## Resume after done
+
+This version intentionally supports:
+
+```text
+ai::done → comment → ai::resume → ai::analyzing
+```
+
+The same stored `thread_id` and workspace are reused. This is useful when Codex completed too early or you want a follow-up adjustment without losing context.
+
+## Prompt behavior
+
+Russian templates live in:
+
+```text
+app/prompts.py
+```
+
+For code-changing Issues they explicitly require Codex to:
+
+1. inspect repository + applicable `AGENTS.md`;
+2. use a feature branch;
+3. implement instead of merely proposing a plan;
+4. run relevant tests/checks;
+5. commit;
+6. push the feature branch;
+7. return `complete` only after successful implementation and push.
+
+The prompts explicitly forbid asking the user for the GitLab token or printing stored credentials.
+
+## State / atomicity
+
+SQLite uses `(project_id, issue_iid)` as the primary key and WAL mode.
+
+Initial claims are atomic. Resume is a CAS transition from either `waiting` or `done` to `running_resume`, so duplicate webhooks cannot start two turns for one Issue in a single orchestrator instance.
+
+Interrupted `running_initial` / `running_resume` jobs are recovered after restart. The Codex `thread_id` is persisted as soon as the `thread.started` JSON event is observed.
 
 ## Development
 
@@ -334,31 +278,3 @@ source .venv/bin/activate
 pip install -r requirements-dev.txt
 pytest
 ```
-
-For local Python-only development you can run the state/GitLab tests without a Codex login. The actual service startup requires a valid Codex login because it verifies authentication before starting workers.
-
-## Current boundaries
-
-- One running orchestrator container is supported.
-- Repository analysis is read-only; there is no branch creation, commit, push, or merge request creation.
-- A completed issue is not automatically restarted by re-adding `ai::ready`.
-- A failed issue can be explicitly retried by adding `ai::ready` again; that starts a fresh Codex thread and refreshes the checkout.
-- Human answers are read from issue comments after the last orchestrator question note. The current issue description is also supplied on continuation.
-
-## Upstream Codex behavior used by this project
-
-This project relies on Codex CLI behavior documented by OpenAI:
-
-- `codex login --device-auth` supports login on headless machines;
-- `codex login status` checks the current login;
-- `codex exec` is the non-interactive interface;
-- `codex exec --json` emits JSONL including a `thread.started` event with `thread_id`;
-- `codex exec resume <SESSION_ID>` resumes a previous non-interactive session;
-- file-backed `auth.json` can be refreshed by Codex and should be stored persistently.
-
-Official documentation:
-
-- https://developers.openai.com/codex/auth
-- https://developers.openai.com/codex/non-interactive-mode
-- https://developers.openai.com/codex/auth/ci-cd-auth
-- https://developers.openai.com/codex/sandboxing

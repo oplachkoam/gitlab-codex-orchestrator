@@ -13,32 +13,13 @@ class RepositoryError(RuntimeError):
 class RepositoryManager:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.askpass = settings.data_dir / "git-askpass.sh"
-        self._write_askpass()
-
-    def _write_askpass(self) -> None:
-        self.askpass.write_text(
-            "#!/bin/sh\n"
-            "case \"$1\" in\n"
-            "  *Username*) printf '%s\\n' \"${GITLAB_GIT_USERNAME:-oauth2}\" ;;\n"
-            "  *) printf '%s\\n' \"$GITLAB_TOKEN\" ;;\n"
-            "esac\n",
-            encoding="utf-8",
-        )
-        self.askpass.chmod(0o700)
 
     def _git_env(self) -> dict[str, str]:
-        # Intentionally inherit only the minimum environment into git subprocesses.
+        # Git authentication is provided by the global glab credential helper
+        # configured by docker-entrypoint.sh. No token is injected here.
         allow = ["PATH", "HOME", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR"]
         env = {k: os.environ[k] for k in allow if k in os.environ}
-        env.update(
-            {
-                "GIT_ASKPASS": str(self.askpass),
-                "GIT_TERMINAL_PROMPT": "0",
-                "GITLAB_TOKEN": self.settings.gitlab_token,
-                "GITLAB_GIT_USERNAME": "oauth2",
-            }
-        )
+        env["GIT_TERMINAL_PROMPT"] = "0"
         return env
 
     async def _run(self, args: list[str], cwd: Path | None = None) -> str:
@@ -52,7 +33,8 @@ class RepositoryManager:
         out, err = await proc.communicate()
         if proc.returncode != 0:
             raise RepositoryError(
-                f"command failed ({proc.returncode}): {' '.join(args)}\n{err.decode(errors='replace')[-4000:]}"
+                f"command failed ({proc.returncode}): {' '.join(args)}\n"
+                f"{err.decode(errors='replace')[-4000:]}"
             )
         return out.decode(errors="replace")
 
